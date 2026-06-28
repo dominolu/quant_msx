@@ -71,11 +71,17 @@ class MsxWebSocketClient:
     async def connect(self) -> None:
         if self._ws is not None:
             return
+        await self._open_socket()
+        if self._ping_task is None or self._ping_task.done():
+            self._ping_task = asyncio.create_task(self._heartbeat_loop())
+        if self.status.subscriptions:
+            await self._send_stream_action("subscribe", sorted(self.status.subscriptions))
+
+    async def _open_socket(self) -> None:
+        if self._ws is not None:
+            return
         self._ws = await websockets.connect(self.url)
         self.status.connected = True
-        self._ping_task = asyncio.create_task(self._heartbeat_loop())
-        if self.status.subscriptions:
-            await self.subscribe_streams(sorted(self.status.subscriptions))
 
     async def close(self) -> None:
         if self._ping_task is not None:
@@ -108,7 +114,9 @@ class MsxWebSocketClient:
                 pass
         self._ws = None
         self.status.connected = False
-        await self.connect()
+        await self._open_socket()
+        if self.status.subscriptions:
+            await self._send_stream_action("subscribe", sorted(self.status.subscriptions))
 
     async def _send(self, payload: dict[str, Any]) -> None:
         if self._ws is None:
@@ -142,10 +150,18 @@ class MsxWebSocketClient:
         await self._send({"action": "ping"})
 
     async def subscribe(self, subscription: MsxWsSubscription) -> None:
+        self._ensure_subscription_market(subscription)
         await self.subscribe_streams([subscription.stream])
 
     async def unsubscribe(self, subscription: MsxWsSubscription) -> None:
+        self._ensure_subscription_market(subscription)
         await self.unsubscribe_streams([subscription.stream])
+
+    def _ensure_subscription_market(self, subscription: MsxWsSubscription) -> None:
+        if subscription.market != self.market:
+            raise ValueError(
+                f"Cannot use {subscription.market} subscription on {self.market} WebSocket client"
+            )
 
     async def subscribe_streams(self, streams: list[str]) -> None:
         await self._stream_action("subscribe", streams)
@@ -159,6 +175,9 @@ class MsxWebSocketClient:
     async def _stream_action(self, action: WsAction, streams: list[str]) -> None:
         if not streams:
             return
+        await self._send_stream_action(action, streams)
+
+    async def _send_stream_action(self, action: WsAction, streams: list[str]) -> None:
         await self._send({"action": action, "streams": streams})
 
     async def subscribe_ticker(self, symbol: str) -> None:

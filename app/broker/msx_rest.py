@@ -1,77 +1,44 @@
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
-import json
-import time
-from dataclasses import dataclass
 from typing import Any, Literal
-from urllib.parse import urlencode
 
 import httpx
 
+from app.broker.auth import MsxCredentials, MsxSigner
+from app.broker.common import (
+    HttpMethod,
+    JsonDict,
+    Market,
+    MsxApiError,
+    MsxAuthError,
+    MsxHttpError,
+    MsxRestError,
+    build_query_string,
+    drop_none,
+    json_body,
+    normalize_error_code,
+)
+from app.broker.endpoints import (
+    FUTURES_PREFIX,
+    LEGACY_FDATA_PREFIX,
+    SPOT_PREFIX,
+    Endpoint,
+    endpoint,
+)
+from app.broker.transport import AsyncRateLimiter, HttpTransport, RetryConfig
 from app.core.config import settings
-
-JsonDict = dict[str, Any]
-HttpMethod = Literal["GET", "POST"]
-
-
-class MsxRestError(Exception):
-    """Base class for MSX REST errors."""
-
-
-@dataclass(slots=True)
-class MsxHttpError(MsxRestError):
-    status_code: int
-    method: str
-    path: str
-    body: Any
-
-    def __str__(self) -> str:
-        return f"MSX HTTP {self.status_code} for {self.method} {self.path}: {self.body}"
-
-
-@dataclass(slots=True)
-class MsxApiError(MsxRestError):
-    code: int
-    message: str
-    method: str
-    path: str
-    payload: JsonDict
-
-    def __str__(self) -> str:
-        return f"MSX API code={self.code} for {self.method} {self.path}: {self.message}"
-
-
-def _drop_none(params: JsonDict | None) -> JsonDict:
-    return {key: value for key, value in (params or {}).items() if value is not None}
-
-
-def _query_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return str(value)
-
-
-def _json_body(data: JsonDict | list[Any] | None) -> str:
-    if data is None:
-        return ""
-    return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
 
 
 class MsxRestClient:
     """MSX REST broker client.
 
-    The client covers every REST endpoint currently summarized in docs/api.md:
-    spot Open API, futures Open API, and legacy V1 derivatives market-data API.
-    Methods return the raw JSON payload so service/domain layers can decide how
-    to normalize data for strategies.
+    Public methods are intentionally kept compatible with the original broker
+    facade, while execution is endpoint-table driven internally.
     """
 
-    SPOT_PREFIX = "/api/v1/stock/open-api"
-    FUTURES_PREFIX = "/api/v1/futures/open-api"
-    LEGACY_FDATA_PREFIX = "/api/v1/fdata"
+    SPOT_PREFIX = SPOT_PREFIX
+    FUTURES_PREFIX = FUTURES_PREFIX
+    LEGACY_FDATA_PREFIX = LEGACY_FDATA_PREFIX
 
     def __init__(
         self,
@@ -79,16 +46,38 @@ class MsxRestClient:
         *,
         api_key: str | None = None,
         secret_key: str | None = None,
-        timeout: float = 30.0,
+        timeout: float | None = None,
         client: httpx.AsyncClient | None = None,
         raise_api_errors: bool = True,
+        retry: RetryConfig | None = None,
+        rate_limiter: AsyncRateLimiter | None = None,
+        max_connections: int | None = None,
+        max_keepalive_connections: int | None = None,
     ) -> None:
+        credentials = MsxCredentials(
+            api_key=settings.msx_api_key if api_key is None else api_key,
+            secret_key=settings.msx_secret_key if secret_key is None else secret_key,
+        )
         self.base_url = (base_url or settings.msx_base_url).rstrip("/")
-        self.api_key = settings.msx_api_key if api_key is None else api_key
-        self.secret_key = settings.msx_secret_key if secret_key is None else secret_key
+        self.credentials = credentials
+        self.signer = MsxSigner(credentials)
         self.raise_api_errors = raise_api_errors
-        self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(timeout=timeout)
+        self.transport = HttpTransport(
+            self.base_url,
+            timeout=timeout or settings.msx_http_timeout_seconds,
+            client=client,
+            retry=retry
+            or RetryConfig(
+                attempts=settings.msx_http_retry_attempts,
+                backoff_seconds=settings.msx_http_retry_backoff_seconds,
+            ),
+            rate_limiter=rate_limiter
+            or AsyncRateLimiter(settings.msx_http_requests_per_second or None),
+            max_connections=max_connections or settings.msx_http_max_connections,
+            max_keepalive_connections=(
+                max_keepalive_connections or settings.msx_http_max_keepalive_connections
+            ),
+        )
 
     async def __aenter__(self) -> MsxRestClient:
         return self
@@ -97,8 +86,7 @@ class MsxRestClient:
         await self.close()
 
     async def close(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
+        await self.transport.close()
 
     def sign(
         self,
@@ -109,19 +97,11 @@ class MsxRestClient:
         body: str = "",
         timestamp: int | None = None,
     ) -> tuple[str, str]:
-        ts = str(timestamp or int(time.time() * 1000))
-        query_string = self.build_query_string(query)
-        payload = f"{ts}{method.upper()}{request_path}{query_string}{body}"
-        digest = hmac.new(self.secret_key.encode(), payload.encode(), hashlib.sha256).digest()
-        return ts, base64.b64encode(digest).decode()
+        return self.signer.sign(method, request_path, query=query, body=body, timestamp=timestamp)
 
     @staticmethod
     def build_query_string(query: JsonDict | None) -> str:
-        params = _drop_none(query)
-        if not params:
-            return ""
-        sorted_items = [(key, _query_value(params[key])) for key in sorted(params)]
-        return "?" + urlencode(sorted_items)
+        return build_query_string(query)
 
     def _auth_headers(
         self,
@@ -131,14 +111,9 @@ class MsxRestClient:
         query: JsonDict | None,
         body: str,
     ) -> JsonDict:
-        if not self.api_key or not self.secret_key:
-            raise ValueError("MSX API key and secret key are required for authenticated requests")
-        timestamp, signature = self.sign(method, path, query=query, body=body)
-        return {
-            "ACCESS-KEY": self.api_key,
-            "ACCESS-SIGN": signature,
-            "ACCESS-TIMESTAMP": timestamp,
-        }
+        if not self.credentials.configured:
+            raise MsxAuthError("MSX API key and secret key are required for authenticated requests")
+        return self.signer.auth_headers(method, path, query=query, body=body)
 
     async def request(
         self,
@@ -149,20 +124,34 @@ class MsxRestClient:
         body: JsonDict | list[Any] | None = None,
         auth: bool = True,
     ) -> Any:
-        method = method.upper()  # type: ignore[assignment]
-        params = _drop_none(query)
-        raw_body = _json_body(body) if method == "POST" else ""
-        headers: JsonDict = {}
-        if method == "POST":
-            headers["Content-Type"] = "application/json"
-        if auth:
-            headers.update(self._auth_headers(method, path, query=params, body=raw_body))
+        ad_hoc = Endpoint("ad_hoc", method.upper(), path, auth, "spot")  # type: ignore[arg-type]
+        return await self._execute(ad_hoc, query=query, body=body, path=path)
 
-        response = await self._client.request(
-            method,
-            f"{self.base_url}{path}",
-            params=[(key, _query_value(params[key])) for key in sorted(params)] or None,
-            content=raw_body.encode("utf-8") if raw_body else None,
+    async def _execute(
+        self,
+        endpoint_: Endpoint,
+        *,
+        query: JsonDict | None = None,
+        body: JsonDict | list[Any] | None = None,
+        path: str | None = None,
+        path_params: JsonDict | None = None,
+    ) -> Any:
+        request_path = path or endpoint_.path(**drop_none(path_params))
+        params = drop_none(query)
+        raw_body = json_body(body) if endpoint_.method == "POST" else ""
+        headers: JsonDict = {}
+        if endpoint_.method == "POST":
+            headers["Content-Type"] = "application/json"
+        if endpoint_.auth:
+            headers.update(
+                self._auth_headers(endpoint_.method, request_path, query=params, body=raw_body)
+            )
+
+        response = await self.transport.send(
+            endpoint_,
+            path=request_path,
+            query=params,
+            body_bytes=raw_body.encode("utf-8") if raw_body else None,
             headers=headers,
         )
 
@@ -172,15 +161,21 @@ class MsxRestClient:
             payload = response.text
 
         if response.status_code >= 400:
-            raise MsxHttpError(response.status_code, method, path, payload)
+            raise MsxHttpError(response.status_code, endpoint_.method, request_path, payload)
 
         if self.raise_api_errors and isinstance(payload, dict):
             code = payload.get("code")
-            if code not in (None, 0):
+            if code is not None and str(code) != "0":
                 message = str(
                     payload.get("msg") or payload.get("message") or payload.get("error") or ""
                 )
-                raise MsxApiError(int(code), message, method, path, payload)
+                raise MsxApiError(
+                    normalize_error_code(code),
+                    message,
+                    endpoint_.method,
+                    request_path,
+                    payload,
+                )
 
         return payload
 
@@ -190,10 +185,36 @@ class MsxRestClient:
     async def post(self, path: str, *, body: JsonDict | list[Any] | None = None) -> Any:
         return await self.request("POST", path, body=body, auth=True)
 
-    # Spot REST endpoints -------------------------------------------------
+    async def create_order(self, market: Market, **kwargs: Any) -> Any:
+        if market == "spot":
+            return await self.create_spot_order(**kwargs)
+        if market == "futures":
+            return await self.create_futures_order(**kwargs)
+        raise ValueError(f"Unsupported MSX market: {market}")
+
+    async def cancel_order(self, market: Market, **kwargs: Any) -> Any:
+        if market == "spot":
+            return await self.cancel_spot_order(**kwargs)
+        if market == "futures":
+            return await self.cancel_futures_order(**kwargs)
+        raise ValueError(f"Unsupported MSX market: {market}")
+
+    async def get_depth(self, market: Market, **kwargs: Any) -> Any:
+        if market == "spot":
+            return await self.get_spot_depth(**kwargs)
+        if market == "futures":
+            return await self.get_futures_orderbook(**kwargs)
+        raise ValueError(f"Unsupported MSX market: {market}")
+
+    async def get_klines(self, market: Market, **kwargs: Any) -> Any:
+        if market == "spot":
+            return await self.get_spot_klines(**kwargs)
+        if market == "futures":
+            return await self.get_futures_klines(**kwargs)
+        raise ValueError(f"Unsupported MSX market: {market}")
 
     async def get_spot_assets(self, symbol: str | None = None) -> Any:
-        return await self.get(f"{self.SPOT_PREFIX}/assets", query={"symbol": symbol}, auth=True)
+        return await self._execute(endpoint("spot.assets"), query={"symbol": symbol})
 
     async def create_spot_order(
         self,
@@ -215,29 +236,25 @@ class MsxRestClient:
             "clientOid": client_oid,
             **extra,
         }
-        return await self.post(f"{self.SPOT_PREFIX}/order", body=_drop_none(body))
+        return await self._execute(endpoint("spot.create_order"), body=drop_none(body))
 
     async def batch_create_spot_orders(self, orders: list[JsonDict]) -> Any:
-        return await self.post(f"{self.SPOT_PREFIX}/batchOrder", body={"orders": orders})
+        return await self._execute(endpoint("spot.batch_create_orders"), body={"orders": orders})
 
     async def cancel_spot_order(self, *, symbol: str, order_id: str) -> Any:
-        return await self.post(
-            f"{self.SPOT_PREFIX}/cancelOrder",
+        return await self._execute(
+            endpoint("spot.cancel_order"),
             body={"symbol": symbol, "orderId": order_id},
         )
 
     async def batch_cancel_spot_orders(self, *, symbol: str, order_ids: list[str]) -> Any:
-        return await self.post(
-            f"{self.SPOT_PREFIX}/batchCancelOrder",
+        return await self._execute(
+            endpoint("spot.batch_cancel_orders"),
             body={"symbol": symbol, "orderIds": order_ids},
         )
 
     async def get_spot_depth(self, *, symbol: str, limit: int | None = None) -> Any:
-        return await self.get(
-            f"{self.SPOT_PREFIX}/depth",
-            query={"symbol": symbol, "limit": limit},
-            auth=False,
-        )
+        return await self._execute(endpoint("spot.depth"), query={"symbol": symbol, "limit": limit})
 
     async def get_spot_klines(
         self,
@@ -248,8 +265,8 @@ class MsxRestClient:
         end_time: int | None = None,
         limit: int | None = None,
     ) -> Any:
-        return await self.get(
-            f"{self.SPOT_PREFIX}/klines",
+        return await self._execute(
+            endpoint("spot.klines"),
             query={
                 "symbol": symbol,
                 "interval": interval,
@@ -257,7 +274,6 @@ class MsxRestClient:
                 "endTime": end_time,
                 "limit": limit,
             },
-            auth=False,
         )
 
     async def get_spot_open_orders(
@@ -268,10 +284,9 @@ class MsxRestClient:
         page: int | None = None,
         size: int | None = None,
     ) -> Any:
-        return await self.get(
-            f"{self.SPOT_PREFIX}/openOrders",
+        return await self._execute(
+            endpoint("spot.open_orders"),
             query={"symbol": symbol, "side": side, "page": page, "size": size},
-            auth=True,
         )
 
     async def get_spot_history_orders(
@@ -284,8 +299,8 @@ class MsxRestClient:
         page: int | None = None,
         size: int | None = None,
     ) -> Any:
-        return await self.get(
-            f"{self.SPOT_PREFIX}/historyOrders",
+        return await self._execute(
+            endpoint("spot.history_orders"),
             query={
                 "symbol": symbol,
                 "side": side,
@@ -294,25 +309,19 @@ class MsxRestClient:
                 "page": page,
                 "size": size,
             },
-            auth=True,
         )
 
     async def get_spot_order_detail(self, *, symbol: str, order_id: str) -> Any:
-        return await self.get(
-            f"{self.SPOT_PREFIX}/orderDetail",
+        return await self._execute(
+            endpoint("spot.order_detail"),
             query={"symbol": symbol, "orderId": order_id},
-            auth=True,
         )
 
     async def get_spot_price_steps(self, *, symbol: str) -> Any:
-        return await self.get(
-            f"{self.SPOT_PREFIX}/priceSteps",
-            query={"symbol": symbol},
-            auth=False,
-        )
+        return await self._execute(endpoint("spot.price_steps"), query={"symbol": symbol})
 
     async def get_spot_ticker(self, *, symbol: str) -> Any:
-        return await self.get(f"{self.SPOT_PREFIX}/ticker", query={"symbol": symbol}, auth=False)
+        return await self._execute(endpoint("spot.ticker"), query={"symbol": symbol})
 
     async def get_spot_trades(
         self,
@@ -324,8 +333,8 @@ class MsxRestClient:
         page: int | None = None,
         size: int | None = None,
     ) -> Any:
-        return await self.get(
-            f"{self.SPOT_PREFIX}/trades",
+        return await self._execute(
+            endpoint("spot.trades"),
             query={
                 "symbol": symbol,
                 "orderId": order_id,
@@ -334,17 +343,10 @@ class MsxRestClient:
                 "page": page,
                 "size": size,
             },
-            auth=True,
         )
-
-    # Futures REST endpoints ---------------------------------------------
 
     async def get_futures_account_config(self, *, symbol: str) -> Any:
-        return await self.get(
-            f"{self.FUTURES_PREFIX}/account/config",
-            query={"symbol": symbol},
-            auth=True,
-        )
+        return await self._execute(endpoint("futures.account_config"), query={"symbol": symbol})
 
     async def set_futures_leverage(
         self,
@@ -353,14 +355,14 @@ class MsxRestClient:
         leverage: str,
         margin_mode: Literal[1, 2],
     ) -> Any:
-        return await self.post(
-            f"{self.FUTURES_PREFIX}/account/leverage",
+        return await self._execute(
+            endpoint("futures.set_leverage"),
             body={"symbol": symbol, "leverage": leverage, "marginMode": margin_mode},
         )
 
     async def set_futures_margin_mode(self, *, symbol: str, margin_mode: Literal[1, 2]) -> Any:
-        return await self.post(
-            f"{self.FUTURES_PREFIX}/account/margin-mode",
+        return await self._execute(
+            endpoint("futures.set_margin_mode"),
             body={"symbol": symbol, "marginMode": margin_mode},
         )
 
@@ -373,8 +375,8 @@ class MsxRestClient:
         end_time: int | None = None,
         limit: int | None = None,
     ) -> Any:
-        return await self.get(
-            f"{self.FUTURES_PREFIX}/kline",
+        return await self._execute(
+            endpoint("futures.klines"),
             query={
                 "symbol": symbol,
                 "interval": interval,
@@ -382,11 +384,10 @@ class MsxRestClient:
                 "endTime": end_time,
                 "limit": limit,
             },
-            auth=False,
         )
 
     async def cancel_futures_order(self, *, order_id: int) -> Any:
-        return await self.post(f"{self.FUTURES_PREFIX}/order/cancel", body={"orderId": order_id})
+        return await self._execute(endpoint("futures.cancel_order"), body={"orderId": order_id})
 
     async def create_futures_order(
         self,
@@ -422,7 +423,7 @@ class MsxRestClient:
             "triggerType": trigger_type,
             **extra,
         }
-        return await self.post(f"{self.FUTURES_PREFIX}/order/create", body=_drop_none(body))
+        return await self._execute(endpoint("futures.create_order"), body=drop_none(body))
 
     async def get_futures_entrust_history(
         self,
@@ -437,9 +438,9 @@ class MsxRestClient:
         page_index: int | None = None,
         page_size: int | None = None,
     ) -> Any:
-        return await self.post(
-            f"{self.FUTURES_PREFIX}/order/entrust-history",
-            body=_drop_none(
+        return await self._execute(
+            endpoint("futures.entrust_history"),
+            body=drop_none(
                 {
                     "symbol": symbol,
                     "coType": co_type,
@@ -462,9 +463,9 @@ class MsxRestClient:
         page_index: int | None = None,
         page_size: int | None = None,
     ) -> Any:
-        return await self.post(
-            f"{self.FUTURES_PREFIX}/order/history",
-            body=_drop_none(
+        return await self._execute(
+            endpoint("futures.order_history"),
+            body=drop_none(
                 {
                     "symbol": symbol,
                     "coType": co_type,
@@ -482,9 +483,9 @@ class MsxRestClient:
         page_index: int | None = None,
         page_size: int | None = None,
     ) -> Any:
-        return await self.post(
-            f"{self.FUTURES_PREFIX}/order/limit",
-            body=_drop_none(
+        return await self._execute(
+            endpoint("futures.open_orders"),
+            body=drop_none(
                 {
                     "symbol": symbol,
                     "coType": co_type,
@@ -502,10 +503,10 @@ class MsxRestClient:
         with_id: bool | None = None,
         step: str | None = None,
     ) -> Any:
-        return await self.get(
-            f"{self.FUTURES_PREFIX}/orderbook/{symbol}",
+        return await self._execute(
+            endpoint("futures.orderbook"),
+            path_params={"symbol": symbol},
             query={"depth": depth, "with_id": with_id, "step": step},
-            auth=False,
         )
 
     async def get_futures_positions(
@@ -514,9 +515,9 @@ class MsxRestClient:
         symbol: str | None = None,
         co_type: int | None = None,
     ) -> Any:
-        return await self.post(
-            f"{self.FUTURES_PREFIX}/position/current",
-            body=_drop_none({"symbol": symbol, "coType": co_type}),
+        return await self._execute(
+            endpoint("futures.positions"),
+            body=drop_none({"symbol": symbol, "coType": co_type}),
         )
 
     async def get_futures_position_history(
@@ -527,9 +528,9 @@ class MsxRestClient:
         page_index: int | None = None,
         page_size: int | None = None,
     ) -> Any:
-        return await self.post(
-            f"{self.FUTURES_PREFIX}/position/history",
-            body=_drop_none(
+        return await self._execute(
+            endpoint("futures.position_history"),
+            body=drop_none(
                 {
                     "symbol": symbol,
                     "coType": co_type,
@@ -540,29 +541,19 @@ class MsxRestClient:
         )
 
     async def get_futures_price_steps(self, *, symbol: str) -> Any:
-        return await self.get(f"{self.FUTURES_PREFIX}/price-steps/{symbol}", auth=False)
+        return await self._execute(endpoint("futures.price_steps"), path_params={"symbol": symbol})
 
     async def get_futures_products(self, type: int | None = None) -> Any:
-        return await self.get(
-            f"{self.FUTURES_PREFIX}/products",
-            query={"type": type},
-            auth=False,
-        )
+        return await self._execute(endpoint("futures.products"), query={"type": type})
 
     async def get_futures_ticker(self, *, symbol: str) -> Any:
-        return await self.get(f"{self.FUTURES_PREFIX}/ticker/{symbol}", auth=False)
-
-    # Legacy V1 derivatives endpoints ------------------------------------
+        return await self._execute(endpoint("futures.ticker"), path_params={"symbol": symbol})
 
     async def get_legacy_derivatives_products(self) -> Any:
-        return await self.get(f"{self.LEGACY_FDATA_PREFIX}/productList", auth=False)
+        return await self._execute(endpoint("legacy.products"))
 
     async def get_legacy_derivatives_ticker_price(self, *, symbol: str) -> Any:
-        return await self.get(
-            f"{self.LEGACY_FDATA_PREFIX}/ticker/price",
-            query={"symbol": symbol},
-            auth=False,
-        )
+        return await self._execute(endpoint("legacy.ticker_price"), query={"symbol": symbol})
 
     async def get_legacy_derivatives_depth(
         self,
@@ -570,15 +561,16 @@ class MsxRestClient:
         symbol: str,
         limit: int | None = None,
     ) -> Any:
-        return await self.get(
-            f"{self.LEGACY_FDATA_PREFIX}/depth",
+        return await self._execute(
+            endpoint("legacy.depth"),
             query={"symbol": symbol, "limit": limit},
-            auth=False,
         )
 
-    # Common aliases used by services -------------------------------------
 
-    create_order = create_spot_order
-    cancel_order = cancel_spot_order
-    get_depth = get_spot_depth
-    get_klines = get_spot_klines
+__all__ = [
+    "MsxApiError",
+    "MsxAuthError",
+    "MsxHttpError",
+    "MsxRestClient",
+    "MsxRestError",
+]
