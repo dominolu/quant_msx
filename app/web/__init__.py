@@ -1,0 +1,1 @@
+"""FastAPI-hosted web console."""
