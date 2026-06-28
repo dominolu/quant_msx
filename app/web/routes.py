@@ -33,6 +33,7 @@ async def dashboard() -> str:
         <h1>网格策略</h1>
         <p>当前是 FastAPI 内置前端骨架。后续列表、详情、订单、成交和事件日志都在此基础上扩展。</p>
         <div class="actions">
+          <a href="/grids">网格策略</a>
           <a href="/accounts">账户管理</a>
           <a href="/api/system/info">系统信息</a>
           <a href="/docs">API Docs</a>
@@ -65,6 +66,267 @@ async def dashboard() -> str:
         .catch(() => {
           document.querySelector("#system-status").textContent = "error";
         });
+    </script>
+  </body>
+</html>
+"""
+
+
+@router.get("/grids", response_class=HTMLResponse)
+async def grids_page() -> str:
+    return """
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>网格策略 - quant_msx</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <strong>quant_msx</strong>
+        <span>MSX 网格策略</span>
+      </div>
+      <a href="/">返回控制台</a>
+    </header>
+    <main class="layout">
+      <section class="grid account-summary-grid">
+        <article>
+          <span>运行中</span>
+          <strong id="grid-running">loading</strong>
+        </article>
+        <article>
+          <span>投入资金</span>
+          <strong id="grid-invested">loading</strong>
+        </article>
+        <article>
+          <span>网格收益</span>
+          <strong id="grid-profit">loading</strong>
+        </article>
+      </section>
+
+      <section class="panel account-form-panel">
+        <h1>新增 MSX 网格</h1>
+        <form id="grid-form" class="form-grid">
+          <label>
+            <span>策略名称</span>
+            <input id="grid-name" required maxlength="128" value="BTCUSDT 中性网格" />
+          </label>
+          <label>
+            <span>交易对</span>
+            <input id="grid-symbol" required value="BTCUSDT" />
+          </label>
+          <label>
+            <span>方向</span>
+            <select id="grid-direction">
+              <option value="neutral">中性</option>
+              <option value="long_bias">偏多</option>
+              <option value="short_bias">偏空</option>
+            </select>
+          </label>
+          <label>
+            <span>间距模式</span>
+            <select id="grid-spacing-mode">
+              <option value="geometric">等比</option>
+              <option value="arithmetic">等差</option>
+            </select>
+          </label>
+          <label>
+            <span>杠杆</span>
+            <input id="grid-leverage" type="number" min="1" step="1" value="2" />
+          </label>
+          <label>
+            <span>保证金 USDT</span>
+            <input id="grid-margin" type="number" min="0" step="0.01" value="100" />
+          </label>
+          <label>
+            <span>网格数量</span>
+            <input id="grid-levels" type="number" min="1" step="1" value="10" />
+          </label>
+          <label>
+            <span>基准价</span>
+            <input id="grid-base-price" type="number" min="0" step="0.0001" value="100" />
+          </label>
+          <label>
+            <span>下边界</span>
+            <input id="grid-lower" type="number" min="0" step="0.0001" value="90" />
+          </label>
+          <label>
+            <span>上边界</span>
+            <input id="grid-upper" type="number" min="0" step="0.0001" value="110" />
+          </label>
+          <label>
+            <span>单格数量，可空</span>
+            <input id="grid-order-qty" type="number" min="0" step="0.00000001" />
+          </label>
+          <label>
+            <span>最大亏损 USDT</span>
+            <input id="grid-max-loss" type="number" min="0" step="0.01" value="0" />
+          </label>
+          <label class="wide-field checkbox-field">
+            <input id="grid-start-now" type="checkbox" />
+            <span>创建后立即启动</span>
+          </label>
+          <div class="form-actions wide-field">
+            <button type="submit">创建策略</button>
+            <span id="grid-form-message"></span>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel account-list-panel">
+        <div class="section-heading">
+          <h1>策略列表</h1>
+          <button type="button" id="refresh-grids">刷新</button>
+        </div>
+        <div id="grid-list" class="account-list"></div>
+      </section>
+    </main>
+    <script>
+      const gridState = { items: [] };
+
+      async function api(path, options = {}) {
+        const response = await fetch(path, {
+          headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+          ...options,
+        });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.detail || `HTTP ${response.status}`);
+        }
+        return response.json();
+      }
+
+      function gridPayload() {
+        return {
+          name: document.querySelector("#grid-name").value.trim(),
+          exchange: "MSX",
+          market: "futures",
+          symbol: document.querySelector("#grid-symbol").value.trim().toUpperCase(),
+          direction: document.querySelector("#grid-direction").value,
+          leverage: document.querySelector("#grid-leverage").value,
+          margin_usdt: document.querySelector("#grid-margin").value,
+          spacing_mode: document.querySelector("#grid-spacing-mode").value,
+          grid_levels: document.querySelector("#grid-levels").value,
+          order_qty: document.querySelector("#grid-order-qty").value || "0",
+          stop_loss_price: document.querySelector("#grid-lower").value,
+          take_profit_price: document.querySelector("#grid-upper").value,
+          max_loss_usdt: document.querySelector("#grid-max-loss").value,
+          base_price: document.querySelector("#grid-base-price").value,
+          start_immediately: document.querySelector("#grid-start-now").checked,
+        };
+      }
+
+      async function refreshGrids() {
+        const payload = await api("/api/contract-grids");
+        gridState.items = payload.items;
+        document.querySelector("#grid-running").textContent =
+          String(payload.summary.running_count);
+        document.querySelector("#grid-invested").textContent =
+          `${payload.summary.total_invested_usdt} USDT`;
+        document.querySelector("#grid-profit").textContent =
+          `${payload.summary.total_grid_profit_usdt} USDT`;
+        renderGrids();
+      }
+
+      function renderGrids() {
+        const target = document.querySelector("#grid-list");
+        if (!gridState.items.length) {
+          target.innerHTML = '<div class="empty-state">暂无网格策略</div>';
+          return;
+        }
+        target.innerHTML = gridState.items.map((grid) => `
+          <div class="account-row grid-row" data-id="${grid.id}">
+            <div>
+              <strong>${escapeHtml(grid.name)}</strong>
+              <span>${escapeHtml(grid.exchange)} / ${escapeHtml(grid.symbol)}</span>
+            </div>
+            <span class="account-status status-${statusClass(grid.status)}">
+              ${escapeHtml(grid.status)}
+            </span>
+            <div>
+              <strong>${escapeHtml(grid.invested_usdt)} USDT</strong>
+              <span>${escapeHtml(grid.direction)} · ${escapeHtml(grid.leverage)}x</span>
+            </div>
+            <div>
+              <span>区间 ${escapeHtml(grid.price_range)}</span>
+              <span>下单 ${escapeHtml(grid.order_qty)} · ${escapeHtml(grid.grid_levels)} 格</span>
+            </div>
+            <div>
+              <span>买 ${escapeHtml(grid.lower_order_price)}</span>
+              <span>卖 ${escapeHtml(grid.upper_order_price)}</span>
+            </div>
+            <div class="row-actions">
+              ${grid.status === "running"
+                ? '<button type="button" data-action="pause">暂停</button>'
+                : '<button type="button" data-action="start">启动</button>'}
+              ${grid.status === "paused"
+                ? '<button type="button" data-action="resume">恢复</button>'
+                : ""}
+              <button type="button" data-action="stop">停止</button>
+              <button type="button" data-action="delete">删除</button>
+            </div>
+          </div>
+        `).join("");
+      }
+
+      function statusClass(value) {
+        return String(value).replace(/[^a-zA-Z0-9_-]/g, "");
+      }
+
+      function escapeHtml(value) {
+        return String(value).replace(/[&<>"']/g, (char) => ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#039;",
+        }[char]));
+      }
+
+      document.querySelector("#grid-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        try {
+          await api("/api/contract-grids", {
+            method: "POST",
+            body: JSON.stringify(gridPayload()),
+          });
+          document.querySelector("#grid-form-message").textContent = "已创建";
+          await refreshGrids();
+        } catch (error) {
+          document.querySelector("#grid-form-message").textContent = error.message;
+        }
+      });
+
+      document.querySelector("#refresh-grids").addEventListener("click", () => void refreshGrids());
+      document.querySelector("#grid-list").addEventListener("click", async (event) => {
+        const button = event.target.closest("button");
+        const row = event.target.closest(".account-row");
+        if (!button || !row) return;
+        const grid = gridState.items.find((item) => item.id === Number(row.dataset.id));
+        if (!grid) return;
+        const action = button.dataset.action;
+        if (action === "delete" && !window.confirm(`确认删除策略 ${grid.name}？`)) {
+          return;
+        }
+        const method = action === "delete" ? "DELETE" : "POST";
+        const path = action === "delete"
+          ? `/api/contract-grids/${grid.id}`
+          : `/api/contract-grids/${grid.id}/${action}`;
+        try {
+          await api(path, { method });
+          await refreshGrids();
+        } catch (error) {
+          window.alert(error.message);
+        }
+      });
+
+      refreshGrids().catch((error) => {
+        document.querySelector("#grid-list").innerHTML =
+          `<div class="empty-state">${error.message}</div>`;
+      });
     </script>
   </body>
 </html>

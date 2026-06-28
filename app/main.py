@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from app.api.routes import accounts, system
+from app.api.routes import accounts, grids, system
 from app.core.config import settings
 from app.storage.db import create_db_and_tables
 from app.web.routes import router as web_router
@@ -14,6 +14,7 @@ def create_app() -> FastAPI:
     app.include_router(web_router)
     app.include_router(system.router)
     app.include_router(accounts.router)
+    app.include_router(grids.router)
     return app
 
 

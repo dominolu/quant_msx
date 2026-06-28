@@ -86,7 +86,8 @@ a {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -100,7 +101,8 @@ button {
   cursor: pointer;
 }
 
-input {
+input,
+select {
   width: 100%;
   min-height: 38px;
   border: 1px solid #cbd5e1;
@@ -113,6 +115,21 @@ input {
 input:disabled {
   color: #64748b;
   background: #f8fafc;
+}
+
+.checkbox-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.checkbox-field input {
+  width: 18px;
+  min-height: 18px;
+}
+
+.checkbox-field span {
+  margin-bottom: 0;
 }
 
 .grid {
@@ -229,6 +246,29 @@ article strong {
   border-color: #cbd5e1;
   color: #64748b;
   background: #f1f5f9;
+}
+
+.status-running {
+  border-color: #86efac;
+  color: #166534;
+  background: #f0fdf4;
+}
+
+.status-paused,
+.status-draft {
+  border-color: #fed7aa;
+  color: #9a3412;
+  background: #fff7ed;
+}
+
+.status-stopped {
+  border-color: #cbd5e1;
+  color: #475569;
+  background: #f8fafc;
+}
+
+.grid-row {
+  grid-template-columns: 1.2fr 0.7fr 0.8fr 1.1fr 0.8fr auto;
 }
 
 .empty-state {
