@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import delete
 
 from app.core.config import settings
-from app.domain.grid import GridCreateRequest
+from app.domain.grid import GridCreateRequest, GridReconfigureRequest
 from app.domain.orders import OrderCancelRequest, OrderSubmitRequest
 from app.main import app
 from app.services.order_service import OrderService
@@ -138,6 +138,10 @@ def test_grid_api_lifecycle_and_reconfigure() -> None:
     assert resume_response.json()["grid"]["status"] == "running"
     resumed_orders_response = run(get(f"/api/contract-grids/{grid_id}/orders"))
     assert len(resumed_orders_response.json()["items"]) == 4
+    assert {item["role"] for item in resumed_orders_response.json()["items"]} == {
+        "lower_buy",
+        "upper_sell",
+    }
 
     stop_response = run(post(f"/api/contract-grids/{grid_id}/stop"))
     assert stop_response.status_code == 200
@@ -180,6 +184,69 @@ def test_grid_state_machine_blocks_invalid_transitions_and_duplicate_running() -
     running = [item for item in list_response.json()["items"] if item["status"] == "running"]
     assert len(running) == 1
     assert running[0]["id"] == second_grid_id
+
+
+def test_grid_start_places_only_current_pair_even_with_larger_open_limit() -> None:
+    reset_grid_tables()
+    payload = grid_payload("ADAUSDT")
+    payload["max_open_orders_per_side"] = 5
+
+    create_response = run(post("/api/contract-grids", payload))
+    grid_id = create_response.json()["grid"]["id"]
+    start_response = run(post(f"/api/contract-grids/{grid_id}/start"))
+
+    assert start_response.status_code == 200
+    assert start_response.json()["grid"]["current_round"] == 0
+    orders_response = run(get(f"/api/contract-grids/{grid_id}/orders"))
+    orders = orders_response.json()["items"]
+    assert len(orders) == 2
+    assert {order["role"] for order in orders} == {"lower_buy", "upper_sell"}
+    assert {order["round_no"] for order in orders} == {0}
+
+
+def test_grid_fill_advances_round_reprices_and_replaces_pair() -> None:
+    reset_grid_tables()
+    create_response = run(post("/api/contract-grids", grid_payload("DOGEUSDT")))
+    grid_id = create_response.json()["grid"]["id"]
+    run(post(f"/api/contract-grids/{grid_id}/start"))
+    orders = run(get(f"/api/contract-grids/{grid_id}/orders")).json()["items"]
+    lower_order = next(order for order in orders if order["role"] == "lower_buy")
+    upper_order = next(order for order in orders if order["role"] == "upper_sell")
+
+    fill_response = run(
+        post(
+            f"/api/contract-grids/{grid_id}/orders/{lower_order['id']}/fill",
+            {
+                "price": lower_order["price"],
+                "qty": lower_order["qty"],
+                "exchange_trade_id": "trade-1",
+            },
+        )
+    )
+
+    assert fill_response.status_code == 200
+    grid = fill_response.json()["grid"]
+    assert grid["current_round"] == 1
+    assert grid["base_price"] == lower_order["price"]
+    assert float(grid["grid_profit_usdt"].replace("+", "")) > 0
+    assert float(grid["grid_profit_pct"].replace("%", "").replace("+", "")) > 0
+    assert grid["pnl_updated_at"]
+    updated_orders = run(get(f"/api/contract-grids/{grid_id}/orders")).json()["items"]
+    assert len(updated_orders) == 4
+    by_id = {order["id"]: order for order in updated_orders}
+    assert by_id[lower_order["id"]]["status"] == "filled"
+    assert by_id[upper_order["id"]]["status"] == "canceled"
+    new_open = [
+        order
+        for order in updated_orders
+        if order["status"] == "simulated" and order["round_no"] == 1
+    ]
+    assert len(new_open) == 2
+    assert {order["role"] for order in new_open} == {"lower_buy", "upper_sell"}
+    fills = run(get(f"/api/contract-grids/{grid_id}/fills")).json()["items"]
+    assert len(fills) == 1
+    assert fills[0]["exchange_trade_id"] == "trade-1"
+    assert float(fills[0]["grid_profit_usdt"]) > 0
 
 
 def test_grid_create_rejects_unsafe_or_invalid_params() -> None:
@@ -411,3 +478,275 @@ def test_create_rejects_invalid_exchange() -> None:
     response = run(post("/api/contract-grids", payload))
 
     assert response.status_code == 422
+
+
+def test_directional_grid_start_builds_initial_position_and_stop_flattens() -> None:
+    reset_grid_tables()
+    payload = grid_payload("BNBUSDT")
+    payload["direction"] = "long_bias"
+    create_response = run(post("/api/contract-grids", payload))
+    grid_id = create_response.json()["grid"]["id"]
+
+    start_response = run(post(f"/api/contract-grids/{grid_id}/start"))
+    assert start_response.status_code == 200
+    assert float(start_response.json()["grid"]["current_position_qty"]) > 0
+
+    with SessionLocal() as session:
+        market_orders = session.query(TradingOrderRecord).filter(
+            TradingOrderRecord.source == "grid",
+            TradingOrderRecord.source_id == grid_id,
+            TradingOrderRecord.order_type == "market",
+        ).all()
+        assert len(market_orders) == 1
+        assert market_orders[0].side == "buy"
+
+    stop_response = run(post(f"/api/contract-grids/{grid_id}/stop"))
+    assert stop_response.status_code == 200
+    assert stop_response.json()["grid"]["current_position_qty"] == "0"
+
+    with SessionLocal() as session:
+        market_orders = session.query(TradingOrderRecord).filter(
+            TradingOrderRecord.source == "grid",
+            TradingOrderRecord.source_id == grid_id,
+            TradingOrderRecord.order_type == "market",
+        ).order_by(TradingOrderRecord.id).all()
+        assert len(market_orders) == 2
+        assert market_orders[-1].side == "sell"
+
+
+def test_running_grid_reconfigure_cancels_and_replaces_current_pair() -> None:
+    reset_grid_tables()
+    create_response = run(post("/api/contract-grids", grid_payload("MATICUSDT")))
+    grid_id = create_response.json()["grid"]["id"]
+    run(post(f"/api/contract-grids/{grid_id}/start"))
+
+    reconfigure_response = run(
+        patch(
+            f"/api/contract-grids/{grid_id}/params",
+            {"grid_levels": "12", "lower_boundary": "88", "upper_boundary": "112"},
+        )
+    )
+
+    assert reconfigure_response.status_code == 200
+    meta = reconfigure_response.json()["reconfigure"]
+    assert meta["cancelled_order_count"] == 2
+    assert meta["submitted_order_count"] == 2
+    orders = run(get(f"/api/contract-grids/{grid_id}/orders")).json()["items"]
+    open_orders = [order for order in orders if order["status"] == "simulated"]
+    assert len(open_orders) == 2
+
+
+def test_duplicate_fill_is_ignored_by_trade_id() -> None:
+    reset_grid_tables()
+    create_response = run(post("/api/contract-grids", grid_payload("AVAXUSDT")))
+    grid_id = create_response.json()["grid"]["id"]
+    run(post(f"/api/contract-grids/{grid_id}/start"))
+    order = run(get(f"/api/contract-grids/{grid_id}/orders")).json()["items"][0]
+    payload = {"price": order["price"], "qty": order["qty"], "exchange_trade_id": "dup-trade"}
+
+    first = run(post(f"/api/contract-grids/{grid_id}/orders/{order['id']}/fill", payload))
+    second = run(post(f"/api/contract-grids/{grid_id}/orders/{order['id']}/fill", payload))
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["message"] == "duplicate_fill_ignored"
+    fills = run(get(f"/api/contract-grids/{grid_id}/fills")).json()["items"]
+    assert len(fills) == 1
+
+
+def test_grid_sync_updates_position_pnl_and_rest_counter() -> None:
+    reset_grid_tables()
+
+    class SyncOrderService(OrderService):
+        async def get_open_orders(
+            self,
+            market: str,
+            symbol: str | None = None,
+            account_id: int | None = None,
+        ):
+            return {"data": []}
+
+        async def get_history_orders(
+            self,
+            market: str,
+            symbol: str | None = None,
+            account_id: int | None = None,
+        ):
+            return {"data": []}
+
+        async def get_trades(
+            self,
+            market: str,
+            symbol: str | None = None,
+            account_id: int | None = None,
+        ):
+            return {"data": []}
+
+        async def get_positions(self, account_id: int | None = None, symbol: str | None = None):
+            return {
+                "data": [
+                    {
+                        "symbol": symbol,
+                        "qty": "0.25",
+                        "realizedPnl": "1.5",
+                        "unrealizedPnl": "2.5",
+                        "fundingFee": "-0.1",
+                        "markPrice": "101",
+                    }
+                ]
+            }
+
+    service = GridService(order_service=SyncOrderService())
+    create_result = run(service.create_grid(GridCreateRequest(**grid_payload("LINKUSDT"))))
+    result = run(service.sync_grid_from_rest(create_result.grid.id))
+    grid = result.items[0]
+
+    assert grid.current_position_qty == "0.25"
+    assert grid.realized_pnl_usdt == "+1.50"
+    assert grid.unrealized_pnl_usdt == "+2.50"
+    assert grid.funding_fee_usdt == "-0.10"
+    assert grid.rest_sync_count == 1
+
+
+def test_start_initial_position_failure_marks_grid_error() -> None:
+    reset_grid_tables()
+
+    class InitialPositionFailureService(OrderService):
+        async def place_order(self, request: OrderSubmitRequest):
+            if request.order_type == "market":
+                raise RuntimeError("market order rejected")
+            return await super().place_order(request)
+
+    payload = grid_payload("ATOMUSDT")
+    payload["direction"] = "long_bias"
+    service = GridService(order_service=InitialPositionFailureService())
+    create_result = run(service.create_grid(GridCreateRequest(**payload)))
+
+    with pytest.raises(RuntimeError, match="market order rejected"):
+        run(service.start_grid(create_result.grid.id))
+
+    detail = service.get_detail(create_result.grid.id)
+    assert detail.grid.status == "error"
+    assert "启动失败" in detail.grid.health
+
+
+def test_running_reconfigure_failure_marks_grid_and_record_failed() -> None:
+    reset_grid_tables()
+
+    class ReconfigureFailureService(OrderService):
+        async def submit_grid_orders(
+            self,
+            *,
+            grid_id: int,
+            account_id: int | None,
+            market: str,
+            symbol: str,
+            leverage: str,
+            orders: list[dict[str, object]],
+        ):
+            existing = self.list_orders(source="grid", source_id=grid_id).items
+            if existing:
+                raise RuntimeError("exchange unavailable")
+            return await super().submit_grid_orders(
+                grid_id=grid_id,
+                account_id=account_id,
+                market=market,
+                symbol=symbol,
+                leverage=leverage,
+                orders=orders,
+            )
+
+    service = GridService(order_service=ReconfigureFailureService())
+    create_result = run(service.create_grid(GridCreateRequest(**grid_payload("NEARUSDT"))))
+    run(service.start_grid(create_result.grid.id))
+
+    with pytest.raises(RuntimeError, match="exchange unavailable"):
+        run(
+            service.reconfigure_grid(
+                create_result.grid.id,
+                GridReconfigureRequest(
+                    grid_levels="12",
+                    lower_boundary="88",
+                    upper_boundary="112",
+                ),
+            )
+        )
+
+    detail = service.get_detail(create_result.grid.id)
+    assert detail.grid.status == "error"
+    with SessionLocal() as session:
+        record = session.query(GridReconfigureRecord).one()
+        assert record.status == "failed"
+        assert "exchange unavailable" in record.error_message
+
+
+def test_rest_sync_filled_order_uses_fill_flow_and_replaces_pair() -> None:
+    reset_grid_tables()
+
+    class FilledHistoryService(OrderService):
+        async def get_open_orders(
+            self,
+            market: str,
+            symbol: str | None = None,
+            account_id: int | None = None,
+        ):
+            return {"data": []}
+
+        async def get_history_orders(
+            self,
+            market: str,
+            symbol: str | None = None,
+            account_id: int | None = None,
+        ):
+            with SessionLocal() as session:
+                order = session.query(GridOrderRecord).order_by(GridOrderRecord.id).first()
+                assert order is not None
+                return {
+                    "data": [
+                        {
+                            "orderId": order.exchange_order_id,
+                            "status": "filled",
+                            "filledQty": str(order.qty),
+                            "avgFillPrice": str(order.price),
+                            "fee": "0",
+                        }
+                    ]
+                }
+
+        async def get_trades(
+            self,
+            market: str,
+            symbol: str | None = None,
+            account_id: int | None = None,
+        ):
+            return {"data": []}
+
+        async def get_positions(self, account_id: int | None = None, symbol: str | None = None):
+            return {"data": [{"symbol": symbol, "qty": "0", "markPrice": "100"}]}
+
+    service = GridService(order_service=FilledHistoryService())
+    create_result = run(service.create_grid(GridCreateRequest(**grid_payload("UNIUSDT"))))
+    run(service.start_grid(create_result.grid.id))
+
+    result = run(service.sync_grid_from_rest(create_result.grid.id))
+
+    grid = result.items[0]
+    assert grid.current_round == 1
+    detail = service.get_detail(create_result.grid.id)
+    assert len(detail.fills) == 1
+    assert len([order for order in detail.orders if order.status == "simulated"]) == 2
+
+
+def test_manual_fill_endpoint_forbidden_outside_demo(monkeypatch: pytest.MonkeyPatch) -> None:
+    reset_grid_tables()
+    monkeypatch.setattr(settings, "live_trading_enabled", True)
+    monkeypatch.setattr(settings, "grid_demo_mode", False)
+
+    response = run(
+        post(
+            "/api/contract-grids/1/orders/1/fill",
+            {"price": "1", "qty": "1", "exchange_trade_id": "blocked"},
+        )
+    )
+
+    assert response.status_code == 403

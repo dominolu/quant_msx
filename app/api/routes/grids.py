@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query
 
-from app.domain.grid import GridCreateRequest, GridReconfigureRequest
+from app.core.config import settings
+from app.domain.grid import GridCreateRequest, GridFillRequest, GridReconfigureRequest
 from app.services.grid_service import GridService
 
 router = APIRouter(prefix="/api", tags=["grids"])
@@ -47,6 +48,22 @@ async def reconfigure_contract_grid(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/contract-grids/sync")
+async def sync_contract_grids() -> dict[str, object]:
+    try:
+        return (await service.sync_grid_from_rest()).model_dump()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/contract-grids/{grid_id}/sync")
+async def sync_contract_grid(grid_id: int) -> dict[str, object]:
+    try:
+        return (await service.sync_grid_from_rest(grid_id)).model_dump()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/contract-grids/{grid_id}/pause")
 async def pause_contract_grid(grid_id: int) -> dict[str, object]:
     try:
@@ -86,6 +103,20 @@ async def list_contract_grid_orders(grid_id: int) -> dict[str, object]:
         return {"items": [item.model_dump() for item in service.list_orders(grid_id)]}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/contract-grids/{grid_id}/orders/{order_id}/fill")
+async def fill_contract_grid_order(
+    grid_id: int,
+    order_id: int,
+    request: GridFillRequest,
+) -> dict[str, object]:
+    if settings.live_trading_enabled and not settings.grid_demo_mode:
+        raise HTTPException(status_code=403, detail="manual fill is only available in demo mode")
+    try:
+        return (await service.handle_order_filled(grid_id, order_id, request)).model_dump()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/contract-grids/{grid_id}/fills")

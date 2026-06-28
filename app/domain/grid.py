@@ -86,6 +86,7 @@ class GridStrategyView(BaseModel):
     price_range_upper: str
     price_range: str
     current_position_qty: str
+    current_round: int = 0
     daily_arbitrage_count: int
     total_arbitrage_count: int
     arbitrage_count_label: str
@@ -134,6 +135,8 @@ class GridFillView(BaseModel):
     price: str
     qty: str
     fee_usdt: str
+    grid_profit_usdt: str = "0"
+    rpnl_usdt: str = "0"
     base_price_before: str
     base_price_after: str
     created_at: str
@@ -166,6 +169,13 @@ class GridReconfigureRequest(BaseModel):
     lower_boundary: str | None = None
     upper_boundary: str | None = None
     margin_usdt: str | None = None
+
+
+class GridFillRequest(BaseModel):
+    price: str | None = None
+    qty: str | None = None
+    fee_usdt: str = "0"
+    exchange_trade_id: str = ""
 
 
 class GridReconfigureMeta(BaseModel):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any
 
 from sqlalchemy import desc, select
@@ -29,6 +30,8 @@ from app.storage.models import (
 
 OPEN_ORDER_STATUSES = {"open", "partially_filled", "simulated"}
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9_/-]{2,40}$")
+MIN_ORDER_NOTIONAL_USDT = Decimal("1")
+ORDER_QUANT = Decimal("0.00000001")
 
 
 class OrderService:
@@ -151,9 +154,13 @@ class OrderService:
         submitted: list[GridOrderRecord] = []
         for item in orders:
             side = str(item["side"])
-            price = str(item["price"])
-            qty = str(item["qty"])
+            price = self._normalize_decimal_string(item["price"])
+            qty = self._normalize_decimal_string(item["qty"])
+            if Decimal(price) * Decimal(qty) < MIN_ORDER_NOTIONAL_USDT:
+                raise ValueError("grid order notional must be at least 1 USDT")
             client_order_id = str(item["client_order_id"])
+            round_no = int(item.get("round_no") or 0)
+            paired_open_order_id = item.get("paired_open_order_id")
             trading_order = await self.place_order(
                 OrderSubmitRequest(
                     account_id=account_id,
@@ -179,6 +186,13 @@ class OrderService:
                     qty=self._to_float(qty),
                     status=trading_order.status,
                     role=str(item.get("role") or "grid"),
+                    round_no=round_no,
+                    paired_open_order_id=(
+                        int(paired_open_order_id)
+                        if isinstance(paired_open_order_id, int | str)
+                        and str(paired_open_order_id).isdigit()
+                        else None
+                    ),
                 )
             )
         return submitted
@@ -213,28 +227,50 @@ class OrderService:
             raise ValueError("failed to cancel grid orders: " + "; ".join(errors))
         return cancelled
 
-    async def get_open_orders(self, market: str, symbol: str | None = None) -> Any:
-        broker = self._broker(None)
+    async def get_open_orders(
+        self,
+        market: str,
+        symbol: str | None = None,
+        account_id: int | None = None,
+    ) -> Any:
+        broker = self._broker(account_id)
         try:
             return await broker.orders.get_open_orders(market, symbol=symbol)
         finally:
             await broker.close()
 
-    async def get_history_orders(self, market: str, symbol: str | None = None) -> Any:
-        async with self._rest_client(None) as client:
+    async def get_history_orders(
+        self,
+        market: str,
+        symbol: str | None = None,
+        account_id: int | None = None,
+    ) -> Any:
+        async with self._rest_client(account_id) as client:
             if market == "spot":
                 return await client.get_spot_history_orders(symbol=symbol)
             if market == "futures":
                 return await client.get_futures_order_history(symbol=symbol)
         raise ValueError(f"unsupported market: {market}")
 
-    async def get_trades(self, market: str, symbol: str | None = None) -> Any:
-        async with self._rest_client(None) as client:
+    async def get_trades(
+        self,
+        market: str,
+        symbol: str | None = None,
+        account_id: int | None = None,
+    ) -> Any:
+        async with self._rest_client(account_id) as client:
             if market == "spot":
                 return await client.get_spot_trades(symbol=symbol)
             if market == "futures":
                 return await client.get_futures_entrust_history(symbol=symbol)
         raise ValueError(f"unsupported market: {market}")
+
+    async def get_positions(self, account_id: int | None = None, symbol: str | None = None) -> Any:
+        broker = self._broker(account_id)
+        try:
+            return await broker.account.get_positions(symbol=symbol)
+        finally:
+            await broker.close()
 
     async def _submit_live_order(self, request: OrderSubmitRequest) -> Any:
         broker = self._broker(request.account_id)
@@ -339,11 +375,13 @@ class OrderService:
         qty: float,
         status: str,
         role: str,
+        round_no: int = 0,
+        paired_open_order_id: int | None = None,
     ) -> GridOrderRecord:
         now = utc_now()
         row = GridOrderRecord(
             grid_id=grid_id,
-            round_no=1,
+            round_no=round_no,
             exchange_order_id=exchange_order_id,
             client_order_id=client_order_id,
             side=side,
@@ -354,6 +392,7 @@ class OrderService:
             fee_usdt=0.0,
             status=status,
             role=role,
+            paired_open_order_id=paired_open_order_id,
             submitted_at=now,
             updated_at=now,
         )
@@ -415,6 +454,18 @@ class OrderService:
             raise ValueError("source must be 32 characters or fewer")
         if len(request.client_order_id) > 128:
             raise ValueError("client_order_id must be 128 characters or fewer")
+
+    @staticmethod
+    def _normalize_decimal_string(value: object) -> str:
+        try:
+            parsed = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            raise ValueError("order price and qty must be valid decimals") from None
+        if not parsed.is_finite() or parsed <= 0:
+            raise ValueError("order price and qty must be greater than 0")
+        normalized = parsed.quantize(ORDER_QUANT, rounding=ROUND_DOWN).normalize()
+        text = format(normalized, "f")
+        return text.rstrip("0").rstrip(".") if "." in text else text
 
     @staticmethod
     def _extract_order_id(response: Any) -> str:
