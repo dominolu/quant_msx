@@ -13,4 +13,6 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
 def create_db_and_tables() -> None:
+    import app.storage.models  # noqa: F401
+
     Base.metadata.create_all(bind=engine)

@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     msx_http_max_keepalive_connections: int = 20
     msx_http_requests_per_second: float = 0
 
+    account_credentials_fernet_key: str = ""
+
     database_url: str = "sqlite:///./data/quant_msx.sqlite3"
     live_trading_enabled: bool = False
     grid_demo_mode: bool = True
