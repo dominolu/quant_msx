@@ -176,6 +176,39 @@ class GridReconfigureRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class TradingOrderRecord(Base):
+    __tablename__ = "trading_orders"
+    __table_args__ = (
+        Index("idx_trading_orders_source", "source", "source_id"),
+        Index("idx_trading_orders_symbol_status", "symbol", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("exchange_accounts.id"),
+        nullable=True,
+    )
+    source: Mapped[str] = mapped_column(String(32), default="manual", nullable=False)
+    source_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    market: Mapped[str] = mapped_column(String(16), default="futures", nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    order_type: Mapped[str] = mapped_column(String(16), default="limit", nullable=False)
+    price: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    qty: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    filled_qty: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    avg_fill_price: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    client_order_id: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    exchange_order_id: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    live: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    request_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    response_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 ContractGridStrategyRecord = GridStrategyRecord
 ContractGridOrderRecord = GridOrderRecord
 ContractGridFillRecord = GridFillRecord

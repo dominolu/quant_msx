@@ -23,6 +23,7 @@ from app.domain.grid import (
     GridStrategyView,
     GridSummaryView,
 )
+from app.services.order_service import OrderService
 from app.storage.db import SessionLocal
 from app.storage.models import (
     GridEventRecord,
@@ -44,6 +45,9 @@ class GridService:
     This mirrors the gate_arb contract-grid management surface while keeping
     live order execution outside the service until the order layer is ready.
     """
+
+    def __init__(self, order_service: OrderService | None = None) -> None:
+        self.order_service = order_service or OrderService()
 
     async def list_grids(self, status: str | None = None) -> GridListView:
         return self.list_grids_sync(status=status)
@@ -142,13 +146,14 @@ class GridService:
         row = self._update_grid_state(
             grid_id,
             status="running",
-            health="模拟运行中，等待订单服务接入",
+            health=self._running_health(),
             event_type="started",
             message="启动网格",
             started=True,
             allowed_from={"draft", "paused", "error"},
             check_running_duplicate=True,
         )
+        row = await self._submit_opening_orders(row, failure_prefix="启动挂单失败")
         return GridActionResult(grid=self._to_grid_view(row), message="started")
 
     async def pause_grid(self, grid_id: int) -> GridActionResult:
@@ -160,18 +165,27 @@ class GridService:
             message="暂停网格",
             allowed_from={"running"},
         )
+        cancelled = await self.order_service.cancel_grid_open_orders(grid_id)
+        self._add_event(
+            grid_id,
+            "orders_cancelled",
+            "info",
+            f"暂停网格，已撤销挂单 {cancelled} 个",
+        )
+        row = self._get_grid_or_raise(grid_id)
         return GridActionResult(grid=self._to_grid_view(row), message="paused")
 
     async def resume_grid(self, grid_id: int) -> GridActionResult:
         row = self._update_grid_state(
             grid_id,
             status="running",
-            health="模拟运行中，等待订单服务接入",
+            health=self._running_health(),
             event_type="resumed",
             message="恢复网格",
             allowed_from={"paused"},
             check_running_duplicate=True,
         )
+        row = await self._submit_opening_orders(row, failure_prefix="恢复挂单失败")
         return GridActionResult(grid=self._to_grid_view(row), message="resumed")
 
     async def stop_grid(self, grid_id: int) -> GridActionResult:
@@ -184,6 +198,14 @@ class GridService:
             flatten_position=True,
             allowed_from={"draft", "running", "paused", "error"},
         )
+        cancelled = await self.order_service.cancel_grid_open_orders(grid_id)
+        self._add_event(
+            grid_id,
+            "orders_cancelled",
+            "info",
+            f"停止网格，已撤销挂单 {cancelled} 个",
+        )
+        row = self._get_grid_or_raise(grid_id)
         return GridActionResult(grid=self._to_grid_view(row), message="stopped")
 
     def delete_grid(self, grid_id: int) -> GridListView:
@@ -518,6 +540,103 @@ class GridService:
             )
             session.commit()
 
+    def _mark_grid_error(self, grid_id: int, health: str) -> GridStrategyRecord:
+        return self._update_grid_state(
+            grid_id,
+            status="error",
+            health=health,
+            event_type="error",
+            message=health,
+        )
+
+    def _build_initial_order_plan(self, row: GridStrategyRecord) -> list[dict[str, object]]:
+        levels = max(1, min(row.max_open_orders_per_side, row.grid_levels))
+        orders: list[dict[str, object]] = []
+        for offset in range(1, levels + 1):
+            buy_price = self._grid_price(row, side="buy", offset=offset)
+            sell_price = self._grid_price(row, side="sell", offset=offset)
+            if buy_price > row.price_range_lower:
+                orders.append(
+                    {
+                        "side": "buy",
+                        "price": self._fmt_price(buy_price),
+                        "qty": self._fmt_plain(row.order_qty),
+                        "client_order_id": self._client_order_id(row.id, "buy", offset),
+                        "role": "grid_buy",
+                    }
+                )
+            if sell_price < row.price_range_upper:
+                orders.append(
+                    {
+                        "side": "sell",
+                        "price": self._fmt_price(sell_price),
+                        "qty": self._fmt_plain(row.order_qty),
+                        "client_order_id": self._client_order_id(row.id, "sell", offset),
+                        "role": "grid_sell",
+                    }
+                )
+        if not orders:
+            raise ValueError("no grid orders can be placed inside configured price range")
+        return orders
+
+    async def _submit_opening_orders(
+        self,
+        row: GridStrategyRecord,
+        *,
+        failure_prefix: str,
+    ) -> GridStrategyRecord:
+        try:
+            orders = self._build_initial_order_plan(row)
+            submitted = await self.order_service.submit_grid_orders(
+                grid_id=row.id,
+                account_id=row.account_id,
+                market=row.market,
+                symbol=row.symbol,
+                leverage=self._fmt_plain(row.leverage),
+                orders=orders,
+            )
+            self._add_event(
+                row.id,
+                "orders_submitted",
+                "info",
+                f"已提交网格挂单 {len(submitted)} 个",
+            )
+            return self._get_grid_or_raise(row.id)
+        except Exception as exc:
+            try:
+                cancelled = await self.order_service.cancel_grid_open_orders(row.id)
+            except Exception as cancel_exc:
+                self._add_event(
+                    row.id,
+                    "startup_cancel_failed",
+                    "error",
+                    f"挂单失败后的补偿撤单失败: {cancel_exc}",
+                )
+            else:
+                if cancelled:
+                    self._add_event(
+                        row.id,
+                        "startup_orders_cancelled",
+                        "warning",
+                        f"挂单失败后已补偿撤单 {cancelled} 个",
+                    )
+            self._mark_grid_error(row.id, f"{failure_prefix}: {exc}")
+            raise
+
+    @staticmethod
+    def _grid_price(row: GridStrategyRecord, *, side: str, offset: int) -> float:
+        if row.spacing_mode == "geometric":
+            multiplier = (1.0 + row.grid_spacing_value) ** offset
+            if side == "buy":
+                return row.base_price / multiplier
+            return row.base_price * multiplier
+        distance = row.grid_spacing_value * offset
+        return row.base_price - distance if side == "buy" else row.base_price + distance
+
+    @staticmethod
+    def _client_order_id(grid_id: int, side: str, offset: int) -> str:
+        return f"grid-{grid_id}-{side}-{offset}-{int(utc_now().timestamp())}"
+
     def _build_summary(self, rows: list[GridStrategyRecord]) -> GridSummaryView:
         running = [row for row in rows if row.status == "running"]
         invested = sum(row.invested_usdt for row in rows)
@@ -700,6 +819,12 @@ class GridService:
         if row.status == "draft":
             return "草稿"
         return row.status
+
+    @staticmethod
+    def _running_health() -> str:
+        if settings.live_trading_enabled:
+            return "运行中，订单服务已接入实盘"
+        return "模拟运行中，订单服务已接入"
 
     @staticmethod
     def _load_json(raw: str, default: object) -> object:
