@@ -20,7 +20,7 @@ from app.domain.accounts import (
 )
 from app.services.account_credentials import AccountCredentialError, AccountCredentialService
 from app.storage.db import SessionLocal
-from app.storage.models import ExchangeAccountRecord
+from app.storage.models import AccountBalanceSnapshotRecord, ExchangeAccountRecord
 
 
 class ExchangeAccountError(ValueError):
@@ -268,6 +268,81 @@ class ExchangeAccountService:
                 message=message,
                 checks=checks,
             )
+
+    def list_enabled_account_ids(self) -> list[int]:
+        with SessionLocal() as session:
+            rows = session.scalars(
+                select(ExchangeAccountRecord.id).where(
+                    ExchangeAccountRecord.enabled.is_(True),
+                    ExchangeAccountRecord.status != "disabled",
+                )
+            ).all()
+            return [int(row) for row in rows]
+
+    async def snapshot_enabled_accounts(self) -> dict[str, int]:
+        attempted = succeeded = failed = 0
+        for account_id in self.list_enabled_account_ids():
+            attempted += 1
+            try:
+                await self.snapshot_account_balance(account_id)
+            except Exception:
+                failed += 1
+            else:
+                succeeded += 1
+        return {"attempted": attempted, "succeeded": succeeded, "failed": failed}
+
+    async def snapshot_account_balance(self, account_id: int) -> AccountBalanceSnapshotRecord:
+        with SessionLocal() as session:
+            record = session.get(ExchangeAccountRecord, account_id)
+            if record is None:
+                raise ExchangeAccountNotFoundError("account not found")
+            if not record.enabled or record.status == "disabled":
+                raise ExchangeAccountError("account is disabled")
+            detached_record = record
+
+        try:
+            status, message, _checks, payloads = await self.tester.test(detached_record)
+            balance, equity = self._extract_msx_equity(payloads) if status == "healthy" else (0.0, 0.0)
+        except Exception as exc:
+            status = "error"
+            message = f"{type(exc).__name__}: {exc}"
+            payloads = {}
+            balance = equity = 0.0
+
+        now = datetime.utcnow()
+        with SessionLocal() as session:
+            record = session.get(ExchangeAccountRecord, account_id)
+            if record is None:
+                raise ExchangeAccountNotFoundError("account not found")
+            record.status = status
+            record.last_error = message if status != "healthy" else ""
+            record.last_checked_at = now
+            if status == "healthy":
+                record.latest_balance_usdt = balance
+                record.latest_equity_usdt = equity
+                points = self._load_json(record.equity_curve_points_json, [])
+                if not isinstance(points, list):
+                    points = []
+                points = [float(point) for point in points if isinstance(point, int | float)]
+                if equity != 0:
+                    points.append(equity)
+                    points = points[-120:]
+                record.equity_curve_points_json = json.dumps(points)
+            record.updated_at = now
+            snapshot = AccountBalanceSnapshotRecord(
+                account_id=account_id,
+                balance_usdt=balance,
+                equity_usdt=equity,
+                status=status,
+                error_message=message if status != "healthy" else "",
+                raw_payload_json=json.dumps(payloads, sort_keys=True, default=str),
+                created_at=now,
+            )
+            session.add(snapshot)
+            session.commit()
+            session.refresh(snapshot)
+            session.expunge(snapshot)
+            return snapshot
 
     def _to_view(self, record: ExchangeAccountRecord) -> ExchangeAccountView:
         credential_summary = self._load_json(record.credential_summary_json, {})

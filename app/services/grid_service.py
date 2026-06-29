@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import delete, desc, select
@@ -48,6 +48,9 @@ ACTIVE_GRID_STATUSES = {
 RUNNING_GRID_STATUSES = {"starting", "running", "pausing", "paused", "reconfiguring", "error"}
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9_/-]{2,40}$")
 GRID_REPRICE_ORDER_ROLES = {"lower_buy", "upper_sell"}
+GRID_OPEN_ORDER_STATUSES = {"open", "simulated", "partially_filled"}
+GRID_ABNORMAL_ORDER_STATUSES = {"failed", "rejected"}
+GRID_HEALTH_EVENT_DEDUP_SECONDS = 600
 
 
 class GridService:
@@ -443,6 +446,81 @@ class GridService:
             return GridListView(summary=self._build_summary(rows), items=[self.get_detail(grid_id).grid])
         return self.list_grids_sync()
 
+    async def sync_and_check_running_grids(self) -> dict[str, int]:
+        rows = self._load_sync_targets(None)
+        running = [row for row in rows if row.status == "running"]
+        checked = anomalies = 0
+        for row in running:
+            await self._sync_single_grid(row)
+            anomalies += self.check_grid_health(row.id)
+            checked += 1
+        return {"checked": checked, "anomalies": anomalies}
+
+    def check_grid_health(self, grid_id: int) -> int:
+        row = self._get_grid_or_raise(grid_id)
+        if row.status != "running":
+            return 0
+        anomalies: list[tuple[str, str, dict[str, object]]] = []
+        open_orders = self._load_grid_open_orders(grid_id)
+        open_roles = {order.role for order in open_orders}
+        missing_roles = sorted(GRID_REPRICE_ORDER_ROLES - open_roles)
+        if missing_roles:
+            anomalies.append(
+                (
+                    "missing_orders",
+                    "运行中网格缺少当前轮挂单: " + ", ".join(missing_roles),
+                    {"missing_roles": missing_roles, "open_roles": sorted(open_roles)},
+                )
+            )
+        with SessionLocal() as session:
+            abnormal_orders = session.scalars(
+                select(GridOrderRecord)
+                .where(
+                    GridOrderRecord.grid_id == grid_id,
+                    GridOrderRecord.status.in_(tuple(GRID_ABNORMAL_ORDER_STATUSES)),
+                )
+                .order_by(desc(GridOrderRecord.updated_at))
+                .limit(10)
+            ).all()
+        if abnormal_orders:
+            anomalies.append(
+                (
+                    "abnormal_orders",
+                    f"网格存在异常订单 {len(abnormal_orders)} 个",
+                    {
+                        "orders": [
+                            {
+                                "id": order.id,
+                                "exchange_order_id": order.exchange_order_id,
+                                "role": order.role,
+                                "status": order.status,
+                            }
+                            for order in abnormal_orders
+                        ]
+                    },
+                )
+            )
+        target_position = self._target_position_for_health(row)
+        if target_position is not None:
+            tolerance = max(abs(row.order_qty) * 0.5, 1e-8)
+            deviation = row.current_position_qty - target_position
+            if abs(deviation) > tolerance:
+                anomalies.append(
+                    (
+                        "position_deviation",
+                        "策略持仓与目标持仓偏差超出阈值",
+                        {
+                            "current_position_qty": row.current_position_qty,
+                            "target_position_qty": target_position,
+                            "deviation": deviation,
+                            "tolerance": tolerance,
+                        },
+                    )
+                )
+        for anomaly_type, message, payload in anomalies:
+            self._add_grid_health_anomaly(grid_id, anomaly_type, message, payload)
+        return len(anomalies)
+
     def ensure_grid_exists(self, grid_id: int) -> None:
         self._get_grid_or_raise(grid_id)
 
@@ -651,6 +729,44 @@ class GridService:
                 )
             )
             session.commit()
+
+    def _add_grid_health_anomaly(
+        self,
+        grid_id: int,
+        anomaly_type: str,
+        message: str,
+        payload: dict[str, object],
+    ) -> None:
+        dedup_after = utc_now() - timedelta(seconds=GRID_HEALTH_EVENT_DEDUP_SECONDS)
+        event_payload = {"anomaly_type": anomaly_type, **payload}
+        with SessionLocal() as session:
+            existing = session.scalar(
+                select(GridEventRecord.id)
+                .where(
+                    GridEventRecord.grid_id == grid_id,
+                    GridEventRecord.event_type == "grid_health_anomaly",
+                    GridEventRecord.message == message,
+                    GridEventRecord.created_at >= dedup_after,
+                )
+                .order_by(desc(GridEventRecord.created_at))
+            )
+            if existing is not None:
+                return
+        self._add_event(
+            grid_id,
+            "grid_health_anomaly",
+            "warning",
+            message,
+            payload=event_payload,
+        )
+
+    @staticmethod
+    def _target_position_for_health(row: GridStrategyRecord) -> float | None:
+        if row.direction == "long_bias":
+            return row.max_position_qty
+        if row.direction == "short_bias":
+            return -row.max_position_qty
+        return None
 
     def _fill_exists(self, exchange_trade_id: str) -> bool:
         with SessionLocal() as session:

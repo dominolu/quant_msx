@@ -1,11 +1,14 @@
 import pytest
 from cryptography.fernet import Fernet
 from pydantic import ValidationError
+from sqlalchemy import delete
 
 from app.core.config import settings
 from app.domain.accounts import AccountCredentialPayload, ExchangeAccountCreateRequest
 from app.services.account_credentials import AccountCredentialService
 from app.services.exchange_account_service import ExchangeAccountService
+from app.storage.db import SessionLocal, create_db_and_tables
+from app.storage.models import AccountBalanceSnapshotRecord, ExchangeAccountRecord
 
 
 def test_account_create_request_only_allows_msx() -> None:
@@ -47,3 +50,57 @@ def test_extract_msx_equity_from_assets_payload() -> None:
 
     assert balance == 10.5
     assert equity == 113.0
+
+
+def test_snapshot_account_balance_records_history_and_updates_account() -> None:
+    create_db_and_tables()
+    with SessionLocal() as session:
+        session.execute(delete(AccountBalanceSnapshotRecord))
+        session.execute(delete(ExchangeAccountRecord))
+        account = ExchangeAccountRecord(
+            name="snapshot account",
+            account_type="cex",
+            exchange="MSX",
+            status="unverified",
+            enabled=True,
+            credentials_encrypted="test",
+            credential_fingerprint="fp",
+            credential_summary_json="{}",
+        )
+        session.add(account)
+        session.commit()
+        account_id = account.id
+
+    class SnapshotTester:
+        async def test(self, record: ExchangeAccountRecord):
+            return (
+                "healthy",
+                "ok",
+                [],
+                {
+                    "assets": {
+                        "data": [
+                            {"asset": "USDT", "available": "15", "equity": "20"},
+                            {"asset": "BTC", "valueUsdt": "30"},
+                        ]
+                    }
+                },
+            )
+
+    service = ExchangeAccountService(tester=SnapshotTester())  # type: ignore[arg-type]
+    snapshot = asyncio_run(service.snapshot_account_balance(account_id))
+
+    assert snapshot.balance_usdt == 15
+    assert snapshot.equity_usdt == 50
+    assert snapshot.status == "healthy"
+    with SessionLocal() as session:
+        account = session.get(ExchangeAccountRecord, account_id)
+        assert account is not None
+        assert account.latest_balance_usdt == 15
+        assert account.latest_equity_usdt == 50
+
+
+def asyncio_run(coro):
+    import asyncio
+
+    return asyncio.run(coro)

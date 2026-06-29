@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/quant_msx.sqlite3"
     live_trading_enabled: bool = False
     grid_demo_mode: bool = True
+    scheduler_enabled: bool = False
+    scheduler_initial_delay_seconds: float = 10.0
+    scheduler_lock_ttl_seconds: float = 120.0
+    grid_health_sync_interval_seconds: float = 60.0
+    account_balance_snapshot_interval_seconds: float = 300.0
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

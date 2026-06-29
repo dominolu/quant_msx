@@ -32,6 +32,8 @@ def _ensure_sqlite_columns() -> None:
         "grid_fills": {
             "rpnl_usdt": "ALTER TABLE grid_fills ADD COLUMN rpnl_usdt FLOAT NOT NULL DEFAULT 0",
         },
+        "account_balance_snapshots": {},
+        "scheduler_locks": {},
     }
     with engine.begin() as conn:
         for table, columns in table_columns.items():

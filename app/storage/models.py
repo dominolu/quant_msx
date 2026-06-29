@@ -34,6 +34,31 @@ class ExchangeAccountRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class AccountBalanceSnapshotRecord(Base):
+    __tablename__ = "account_balance_snapshots"
+    __table_args__ = (
+        Index("idx_account_balance_snapshots_account_created", "account_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("exchange_accounts.id"), nullable=False)
+    balance_usdt: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    equity_usdt: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    raw_payload_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class SchedulerLockRecord(Base):
+    __tablename__ = "scheduler_locks"
+
+    name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    owner: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    locked_until: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
 class GridStrategyRecord(Base):
     __tablename__ = "grid_strategies"
 

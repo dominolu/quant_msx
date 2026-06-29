@@ -608,6 +608,28 @@ def test_grid_sync_updates_position_pnl_and_rest_counter() -> None:
     assert grid.rest_sync_count == 1
 
 
+def test_grid_health_records_only_anomalies_and_deduplicates() -> None:
+    reset_grid_tables()
+    service = GridService()
+    create_result = run(service.create_grid(GridCreateRequest(**grid_payload("HEALTHUSDT"))))
+    run(service.start_grid(create_result.grid.id))
+    with SessionLocal() as session:
+        order = session.query(GridOrderRecord).filter(
+            GridOrderRecord.grid_id == create_result.grid.id,
+            GridOrderRecord.role == "lower_buy",
+        ).one()
+        order.status = "canceled"
+        session.commit()
+
+    assert service.check_grid_health(create_result.grid.id) == 1
+    assert service.check_grid_health(create_result.grid.id) == 1
+    events = service.list_events(create_result.grid.id)
+    health_events = [event for event in events if event.event_type == "grid_health_anomaly"]
+
+    assert len(health_events) == 1
+    assert "缺少当前轮挂单" in health_events[0].message
+
+
 def test_start_initial_position_failure_marks_grid_error() -> None:
     reset_grid_tables()
 
